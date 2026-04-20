@@ -20,6 +20,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
+# AI Agent import (optional - will gracefully degrade if not available)
+try:
+    from ai_agent import AIAgent
+    AI_AVAILABLE = True
+except ImportError:
+    AI_AVAILABLE = False
+    print("Warning: AI agent not available. Running in rule-based mode only.")
+
 
 class Pet:
     """Represents a pet with basic information and manages its own tasks."""
@@ -449,92 +457,124 @@ class Scheduler:
         self.owner = owner
 
     def generate_plan(self) -> dict:
-        """Creates the daily schedule across all owner's pets using greedy algorithm."""
-        # Edge case: no pets
+        """Creates the daily schedule across all owner's pets, enhanced with AI evaluation."""
+        base_plan = self._build_base_plan()
+        return self._enhance_with_ai(base_plan) if AI_AVAILABLE else base_plan
+
+    def generate_base_plan(self) -> dict:
+        """Returns the rule-based schedule only, without AI enhancement.
+
+        Used by the reliability evaluation script to obtain a deterministic base
+        plan that can then be passed to AIAgent directly with different settings
+        (e.g., few_shot=True vs. few_shot=False) for comparison testing.
+        """
+        return self._build_base_plan()
+
+    def _build_base_plan(self) -> dict:
+        """Core greedy scheduling logic — no AI calls.
+
+        1. Prioritize tasks by priority score (high > medium > low), then duration.
+        2. Fit tasks greedily into the available time budget.
+        3. Build reasoning explanation for scheduled and skipped tasks.
+        """
+        avail = self.owner.available_time_minutes
+
         if not self.owner.pets:
             return {
-                'owner': self.owner,
-                'scheduled_tasks': [],
-                'total_time_minutes': 0,
-                'remaining_time_minutes': self.owner.available_time_minutes,
+                'owner': self.owner, 'scheduled_tasks': [], 'skipped_tasks': [],
+                'total_time_minutes': 0, 'remaining_time_minutes': avail,
                 'reasoning': "Owner has no pets to care for.",
-                'skipped_tasks': [],
                 'pets_count': 0,
                 'conflict_info': {
-                    'has_conflict': False,
-                    'total_required_minutes': 0,
-                    'available_minutes': self.owner.available_time_minutes,
-                    'overflow_minutes': 0,
-                    'message': "OK: No conflicts. 0 minutes required, " + str(self.owner.available_time_minutes) + " available."
-                }
+                    'has_conflict': False, 'total_required_minutes': 0,
+                    'available_minutes': avail, 'overflow_minutes': 0,
+                    'message': f"OK: No conflicts. 0 minutes required, {avail} available."
+                },
             }
 
-        # Get all incomplete tasks from all pets
         all_tasks = self.owner.get_all_incomplete_tasks()
 
-        # Edge case: no tasks to schedule
         if not all_tasks:
             return {
-                'owner': self.owner,
-                'scheduled_tasks': [],
-                'total_time_minutes': 0,
-                'remaining_time_minutes': self.owner.available_time_minutes,
+                'owner': self.owner, 'scheduled_tasks': [], 'skipped_tasks': [],
+                'total_time_minutes': 0, 'remaining_time_minutes': avail,
                 'reasoning': "No incomplete tasks to schedule.",
-                'skipped_tasks': [],
                 'pets_count': len(self.owner.pets),
                 'conflict_info': {
-                    'has_conflict': False,
-                    'total_required_minutes': 0,
-                    'available_minutes': self.owner.available_time_minutes,
-                    'overflow_minutes': 0,
-                    'message': "OK: No conflicts. 0 minutes required, " + str(self.owner.available_time_minutes) + " available."
-                }
+                    'has_conflict': False, 'total_required_minutes': 0,
+                    'available_minutes': avail, 'overflow_minutes': 0,
+                    'message': f"OK: No conflicts. 0 minutes required, {avail} available."
+                },
             }
 
-        # Edge case: no time available
-        if self.owner.available_time_minutes == 0:
+        if avail == 0:
             conflict_info = self.detect_time_conflicts(all_tasks)
             return {
-                'owner': self.owner,
-                'scheduled_tasks': [],
-                'total_time_minutes': 0,
-                'remaining_time_minutes': 0,
+                'owner': self.owner, 'scheduled_tasks': [], 'skipped_tasks': all_tasks.copy(),
+                'total_time_minutes': 0, 'remaining_time_minutes': 0,
                 'reasoning': "Owner has no available time for pet care tasks.",
-                'skipped_tasks': all_tasks.copy(),
                 'pets_count': len(self.owner.pets),
-                'conflict_info': conflict_info
+                'conflict_info': conflict_info,
             }
 
-        # Detect upfront time conflicts
         conflict_info = self.detect_time_conflicts(all_tasks)
-
-        # Step 1: Prioritize tasks (sort by priority score, highest first)
         sorted_tasks = self.prioritize_tasks(all_tasks)
+        selected_tasks = self.fit_tasks_to_time(sorted_tasks, avail)
+        total_time = sum(t.duration_minutes for t in selected_tasks)
+        skipped_tasks = [t for t in sorted_tasks if t not in selected_tasks]
 
-        # Step 2: Fit tasks into available time
-        selected_tasks = self.fit_tasks_to_time(sorted_tasks, self.owner.available_time_minutes)
-
-        # Step 3: Calculate metrics
-        total_time = sum(task.duration_minutes for task in selected_tasks)
-        remaining_time = self.owner.available_time_minutes - total_time
-
-        # Step 4: Determine which tasks were skipped
-        skipped_tasks = [task for task in sorted_tasks if task not in selected_tasks]
-
-        # Step 5: Build reasoning explanation
-        reasoning = self.build_reasoning(selected_tasks, skipped_tasks)
-
-        # Step 6: Create and return the plan as a dictionary
         return {
             'owner': self.owner,
             'scheduled_tasks': selected_tasks,
-            'total_time_minutes': total_time,
-            'remaining_time_minutes': remaining_time,
-            'reasoning': reasoning,
             'skipped_tasks': skipped_tasks,
+            'total_time_minutes': total_time,
+            'remaining_time_minutes': avail - total_time,
+            'reasoning': self.build_reasoning(selected_tasks, skipped_tasks),
             'pets_count': len(self.owner.pets),
-            'conflict_info': conflict_info
+            'conflict_info': conflict_info,
         }
+
+    def _enhance_with_ai(self, base_plan: dict) -> dict:
+        """Enhance the base plan with AI evaluation and reasoning."""
+        try:
+            ai_agent = AIAgent()
+            pet_care_context = self._get_pet_care_context()
+            enhanced_plan = ai_agent.evaluate_and_enhance_schedule(
+                base_plan, self.owner, pet_care_context
+            )
+            return enhanced_plan
+        except Exception as e:
+            # Graceful degradation - return base plan with error note
+            print(f"AI enhancement failed: {e}")
+            base_plan.update({
+                'ai_quality_score': 75,
+                'ai_issues_found': [f"AI evaluation failed: {str(e)}"],
+                'ai_recommendations': ["Manual review recommended"],
+                'ai_confidence': "low",
+                'ai_reasoning_steps': ["AI system encountered an error"],
+                'ai_enhanced': False
+            })
+            return base_plan
+
+    def _get_pet_care_context(self) -> dict:
+        """Get additional context about pets and care needs for AI evaluation."""
+        context = {
+            'pet_special_needs': [],
+            'age_considerations': [],
+            'task_patterns': []
+        }
+
+        for pet in self.owner.pets:
+            if pet.special_needs:
+                context['pet_special_needs'].append(f"{pet.name}: {pet.special_needs}")
+
+            # Age considerations
+            if pet.age < 1:
+                context['age_considerations'].append(f"{pet.name} is a puppy/kitten ({pet.age}y) - needs frequent care")
+            elif pet.age > 10:
+                context['age_considerations'].append(f"{pet.name} is senior ({pet.age}y) - may need gentler activities")
+
+        return context
 
     def prioritize_tasks(self, tasks: list[Task]) -> list[Task]:
         """Sorts tasks by priority (highest first), then by duration (shorter first)."""
